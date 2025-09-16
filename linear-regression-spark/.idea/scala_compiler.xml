@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project version="4">
+  <component name="ScalaCompilerConfiguration">
+    <option name="separateProdTestSources" value="true" />
+    <profile name="sbt 1" modules="Scryfall lienar regression,Scryfall lienar regression.main,Scryfall lienar regression.test,Scryfall linear regression,Scryfall linear regression.main,Scryfall linear regression.test,linear-regression-spark,linear-regression-spark.main,linear-regression-spark.test" />
+  </component>
+</project>

@@ -1,12 +1,12 @@
 package linearregression
 
-import org.apache.spark.sql.SparkSession
-import org.apache.spark.sql.functions.col
+import org.apache.spark.sql.{DataFrame, SparkSession, functions}
+import org.apache.spark.sql.functions.{array_contains, avg, col, lit, size, udf, when}
 import org.apache.spark.ml.feature.{StringIndexer, VectorAssembler}
 import org.apache.spark.ml.regression.LinearRegression
 
 object Application {
-  def main(args: Array[String]): Unit ={
+  def main(args: Array[String]): Unit = {
 
     //initialize spark session using all cores
     val spark = SparkSession.builder().appName("Price Prediction")
@@ -14,75 +14,80 @@ object Application {
       .getOrCreate()
 
     //load data
-    //make more generic/add automatic download?
-    val dataPath = "src/main/resources/all-cards-20250916092739.json"
+    val dataPath = "src/main/resources/scryfall-oracle-cards.json"
     val scryfallDataDF = spark.read.json(dataPath)
-    scryfallDataDF.show()
 
-    //clean data - create utils for this and clean more fields
-    val cleanedDataDF = scryfallDataDF.select("mana_cost", "game_changer"
-        , "loyalty", "power", "toughness", "prices.usd")
-      .withColumnRenamed("usd", "label").filter(col("label").isNotNull).withColumn("label", col("label").cast("double"))
-    cleanedDataDF.show()
+    val filteredDf = scryfallDataDF
+      .filter(col("prices.eur").isNotNull && !col("digital"))
+      .withColumn("label", col("prices.eur").cast("double"))
+    filteredDf.select("name", "cmc", "power", "toughness", "colors", "label").show(5, truncate = false)
 
-    //handle categorical data - Create utils for this and hot indexing
-    val manaCostIndexer = new StringIndexer()
-      .setInputCol("mana_cost")
-      .setOutputCol("mana_cost_indexed")
-      .setHandleInvalid("keep") // Handle unseen labels by creating an additional category
 
-    val loyaltyIndexer = new StringIndexer()
-      .setInputCol("loyalty")
-      .setOutputCol("loyalty_indexed")
-      .setHandleInvalid("keep")
+    println("-> Starte CMC-Verarbeitung...")
+    val cmcProcessedDf = processCmc(filteredDf)
+    cmcProcessedDf.select("name", "cmc", "power", "label").show(5)
 
-    val powerIndexer = new StringIndexer()
-      .setInputCol("power")
-      .setOutputCol("power_indexed")
-      .setHandleInvalid("keep")
+    val ptProcessedDf = processPowerToughness(cmcProcessedDf)
+    ptProcessedDf.select("name", "cmc", "power", "toughness", "colors", "label").show(5, truncate = false)
 
-    val toughnessIndexer = new StringIndexer()
-      .setInputCol("toughness")
-      .setOutputCol("toughness_indexed")
-      .setHandleInvalid("keep")
-
-    val manaCostIndexed = manaCostIndexer.fit(cleanedDataDF).transform(cleanedDataDF)
-    val loyaltyIndexed = loyaltyIndexer.fit(manaCostIndexed).transform(manaCostIndexed)
-    val powerIndexed = powerIndexer.fit(loyaltyIndexed).transform(loyaltyIndexed)
-    val toughnessIndexed = toughnessIndexer.fit(powerIndexed).transform(powerIndexed)
-
-    // Final DataFrame with all indexed columns
-    val indexedDataDF = toughnessIndexed
-    indexedDataDF.show()
-
-    //assemble features into a single vector
-    val assembler = new VectorAssembler()
-      .setInputCols(Array("mana_cost_indexed", "game_changer", "loyalty_indexed", "power_indexed", "toughness_indexed"))
-      .setOutputCol("features")
-
-    val featureDataDF = assembler.transform(indexedDataDF).select("features", "label")
-    featureDataDF.show()
-    //split the data into training and test data
-    val Array(trainingData, testData) = featureDataDF.randomSplit(Array(0.8, 0.2))
-
-    //create amd train the model
-    val lr = new LinearRegression().setLabelCol("label").setFeaturesCol("features")
-    val lrModel = lr.fit(trainingData)
-
-    //print the coefficients and intercept
-    println(s"Coefficients: ${lrModel.coefficients} Intercept: ${lrModel.intercept}")
-
-    //make and show predictions on test data
-    val predictions = lrModel.transform(testData)
-    predictions.select("features", "label", "prediction").show()
-
-    //evaluate predictions
-    val eval = lrModel.evaluate(testData)
-    println(s"RMSE: ${eval.rootMeanSquaredError}")
-    println(s"R2: ${eval.r2}")
+    val colorProcessedDf = processColors(ptProcessedDf)
+    colorProcessedDf.select(
+      "name", "cmc", "power", "toughness", "color_W", "color_U", "color_G", "color_R", "color_B", "is_colorless",
+      "identity_W", "identity_U", "identity_G", "identity_R", "identity_B", "label").show(5, truncate = false)
 
     //stop the session
     spark.stop()
+  }
+
+  def processCmc(df: DataFrame): DataFrame = {
+    // ensure type is correct
+    val dfWithTypedCmc = df.withColumn("cmc", col("cmc").cast("double"))
+    // calculate avg ignoring null vals
+    val cmcAvg = dfWithTypedCmc.select(avg("cmc")).first().getDouble(0)
+    // fill null values with avg
+    dfWithTypedCmc.na.fill(cmcAvg, Seq("cmc"))
+  }
+
+  def processPowerToughness(df: DataFrame): DataFrame = {
+    // udf to change strings that only have chars into ints
+    // gives back 0 for everything else (X", "*", "1+*" etc)
+    val toIntUDF = udf((s: String) => {
+      if (s != null && s.matches("\\d+")) Some(s.toInt) else None: Option[Int]
+    })
+
+    // create new numeric columns
+    val dfWithNumeric = df
+      .withColumn("power", toIntUDF(col("power")))
+      .withColumn("toughness", toIntUDF(col("toughness")))
+
+    // calculate averages
+    val powerAvg = dfWithNumeric.select(avg("power")).first().getDouble(0)
+    val toughnessAvg = dfWithNumeric.select(avg("toughness")).first().getDouble(0)
+
+    // fill null vals with avg
+    dfWithNumeric.na.fill(Map(
+      "power" -> powerAvg,
+      "toughness" -> toughnessAvg
+    ))
+    }
+
+  def processColors(df: DataFrame): DataFrame = {
+    val manaColors = Seq("W", "U", "B", "R", "G")
+
+    // creates a column for each color and color identity
+    val dfWithColorFlags = manaColors.foldLeft(df) { (tempDf, color) =>
+      tempDf
+        .withColumn(s"identity_$color", array_contains(col("color_identity"), color))
+        .withColumn(s"color_$color", array_contains(col("colors"), color))
+    }
+
+    // creates a condition for "is_colorless"
+    // a card is colorless when all "color_X" columns are false
+    val colorlessCondition = manaColors
+      .map(color => col(s"color_$color") === false)
+      .reduce((cond1, cond2) => cond1 && cond2)
+
+    dfWithColorFlags.withColumn("is_colorless", colorlessCondition)
   }
 
 }

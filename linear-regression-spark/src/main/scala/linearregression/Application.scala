@@ -20,7 +20,7 @@ object Application {
     val scryfallDataDF = spark.read.json(dataPath)
 
     val filteredDf = scryfallDataDF
-      .filter(col("prices.eur").isNotNull && !col("digital"))
+      .filter(col("prices.eur").isNotNull && !col("digital") && col("type_line").contains("Creature"))
       .withColumn("label", col("prices.eur").cast("double"))
     filteredDf.select("name", "cmc", "power", "toughness", "colors", "label", "edhrec_rank", "keywords", "type_line", "legalities", "rarity").show(5, truncate = false)
 
@@ -47,7 +47,7 @@ object Application {
     val distinctKeywords = countValuesInColumn(edhrecProcessedDf, "keywords")
     println(s"Distinct keywords and their counts: ${distinctKeywords.count()}")
     distinctKeywords.orderBy(functions.rand()).show()
-    val keywordProcessedDf = processKeywords(edhrecProcessedDf, 10)
+    val keywordProcessedDf = processKeywords(edhrecProcessedDf, 20)
     keywordProcessedDf.show(5, truncate = false)
 
     //udf to turn the type line into an array of strings
@@ -56,9 +56,10 @@ object Application {
     val dfWithTypeArray = keywordProcessedDf.withColumn("type_line", toArrayUdf(col("type_line")))
     //get disctinct types and their counts
     val distinctTypes = countValuesInColumn(dfWithTypeArray, "type_line")
-    distinctTypes.show()
+    println(s"Distinct types and their counts: ${distinctTypes.count()}")
+    distinctTypes.sort(functions.rand()).show()
 
-    val typeLineProcessedDf = processTypeLine(keywordProcessedDf, 10)
+    val typeLineProcessedDf = processTypeLine(keywordProcessedDf, 20)
     typeLineProcessedDf.show(5, truncate = false)
 
     val legalitiesProcessedDf = processLegalities(typeLineProcessedDf)
@@ -176,7 +177,10 @@ object Application {
   }
 
   def getTopValues(df: DataFrame, colName: String, threshold: Int): Seq[String] = {
-    df.limit(threshold).select(colName).collect().map(row => row.getString(0))
+    if (threshold == -1) //-1 means all values
+      df.select(colName).collect().map(row => row.getString(0))
+    else
+      df.limit(threshold).select(colName).collect().map(row => row.getString(0))
   }
 
 }

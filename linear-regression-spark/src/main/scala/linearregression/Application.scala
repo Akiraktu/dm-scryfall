@@ -47,7 +47,7 @@ object Application {
     val distinctKeywords = countValuesInColumn(edhrecProcessedDf, "keywords")
     println(s"Distinct keywords and their counts: ${distinctKeywords.count()}")
     distinctKeywords.orderBy(functions.rand()).show()
-    val keywordProcessedDf = processKeywords(edhrecProcessedDf, 20)
+    val keywordProcessedDf = processKeywords(edhrecProcessedDf, 50)
     keywordProcessedDf.show(5, truncate = false)
 
     //udf to turn the type line into an array of strings
@@ -59,7 +59,7 @@ object Application {
     println(s"Distinct types and their counts: ${distinctTypes.count()}")
     distinctTypes.sort(functions.rand()).show()
 
-    val typeLineProcessedDf = processTypeLine(keywordProcessedDf, 20)
+    val typeLineProcessedDf = processTypeLine(keywordProcessedDf, 120)
     typeLineProcessedDf.show(5, truncate = false)
 
     val legalitiesProcessedDf = processLegalities(typeLineProcessedDf)

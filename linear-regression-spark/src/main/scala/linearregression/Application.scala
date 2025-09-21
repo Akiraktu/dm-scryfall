@@ -1,10 +1,11 @@
 package linearregression
 
 import jdk.jfr.Threshold
+import org.apache.spark.ml.evaluation.RegressionEvaluator
 import org.apache.spark.sql.{DataFrame, SparkSession, functions}
-import org.apache.spark.sql.functions.{array_contains, avg, col, explode, lit, size, udf, when}
-import org.apache.spark.ml.feature.{StringIndexer, VectorAssembler}
-import org.apache.spark.ml.regression.LinearRegression
+import org.apache.spark.sql.functions.{array_contains, avg, col, explode, lit, size, sum, udf, when}
+import org.apache.spark.ml.feature.{OneHotEncoder, StringIndexer, VectorAssembler}
+import org.apache.spark.ml.regression.{LinearRegression, RandomForestRegressor}
 import org.apache.spark.sql.types.StructType
 
 object Application {
@@ -20,12 +21,12 @@ object Application {
     val scryfallDataDF = spark.read.json(dataPath)
 
     val filteredDf = scryfallDataDF
-      .filter(col("prices.eur").isNotNull && !col("digital") && col("type_line").contains("Creature"))
+      .filter(col("prices.eur").isNotNull && !col("digital") && col("type_line").contains("Creature") && col("card_faces").isNull)
       .withColumn("label", col("prices.eur").cast("double"))
     filteredDf.select("name", "cmc", "power", "toughness", "colors", "label", "edhrec_rank", "keywords", "type_line", "legalities", "rarity").show(5, truncate = false)
 
 
-    println("-> Starte CMC-Verarbeitung...")
+    println("-> Starting feature processing...")
     val cmcProcessedDf = processCmc(filteredDf)
     cmcProcessedDf.select("name", "cmc", "power", "label").show(5)
 
@@ -64,6 +65,72 @@ object Application {
 
     val legalitiesProcessedDf = processLegalities(typeLineProcessedDf)
     legalitiesProcessedDf.show(5, truncate = false)
+
+    val columns = legalitiesProcessedDf.columns
+    val nullCounts = legalitiesProcessedDf.select(columns.map(c => sum(col(c).isNull.cast("int")).alias(c)): _*)
+    nullCounts.show()
+
+    val rarityProcessedDf = processRarity(legalitiesProcessedDf)
+
+    //get all the color, type, keyword and legality columns
+    val colorColumns = getAllRowsWithPrefix(legalitiesProcessedDf, "color_").filter(col => ( col != "color_identity") && (col != "color_indicator"))
+    val identityColumns = getAllRowsWithPrefix(legalitiesProcessedDf, "identity_")
+    val keywordColumns = getAllRowsWithPrefix(legalitiesProcessedDf, "keyword_")
+    val typeColumns = getAllRowsWithPrefix(legalitiesProcessedDf, "types_")
+    val legalityColumns = getAllRowsWithPrefix(legalitiesProcessedDf, "legality_")
+
+    //build the array of feature columns
+    val featureColumns = Array("cmc", "power", "toughness", "edhrec_rank", "rarityEncoded", "is_colorless") ++ colorColumns ++ identityColumns ++ keywordColumns ++ typeColumns ++ legalityColumns
+
+    rarityProcessedDf.select((Array("name", "label") ++ featureColumns).map(col): _*).show(5, truncate = false)
+
+    //check types of feature columns
+    val featureColumnTypes = rarityProcessedDf.select(featureColumns.map(col): _*).dtypes
+    featureColumnTypes.foreach { case (name, dataType) =>
+      println(s"Column: $name, Type: $dataType")
+    }
+
+    //assemble features into a single vector column
+    val assembler = new VectorAssembler()
+      .setInputCols(featureColumns)
+      .setOutputCol("features")
+
+    val assembledDf = assembler.transform(rarityProcessedDf).select("name", "features", "label")
+
+    //split data into training and test sets
+    val Array(trainingData, testData) = assembledDf.randomSplit(Array(0.8, 0.2))
+
+    //create a random forest regressor
+    val forestRegressor = new RandomForestRegressor()
+      .setLabelCol("label")
+      .setFeaturesCol("features")
+      .setNumTrees(100)
+      .setMaxDepth(10)
+      .setSeed(42)
+
+    //train the model
+    println("-> Training the model...")
+    val model = forestRegressor.fit(trainingData)
+
+    //evaluate the model
+    println("-> Evaluating the model...")
+    val predictions = model.transform(testData)
+
+    val rmseEvaluator = new RegressionEvaluator()
+      .setLabelCol("label")
+      .setPredictionCol("prediction")
+      .setMetricName("rmse")
+
+    val r2Evaluator = new RegressionEvaluator()
+      .setLabelCol("label")
+      .setPredictionCol("prediction")
+      .setMetricName("r2")
+
+    val rmse = rmseEvaluator.evaluate(predictions)
+    val r2 = r2Evaluator.evaluate(predictions)
+
+    println(s"Root Mean Squared Error (RMSE): $rmse")
+    println(s"R²: $r2")
 
     //stop the session
     spark.stop()
@@ -151,7 +218,7 @@ object Application {
     val topTypes = getTopValues(distinctTypes, "type_line", threshold)
 
     topTypes.foldLeft(dfWithTypeArray) { (tempDf, typeLine) =>
-      tempDf.withColumn(s"type_$typeLine", array_contains(col("type_line"), typeLine))
+      tempDf.withColumn(s"types_$typeLine", array_contains(col("type_line"), typeLine))
     }
 
   }
@@ -170,8 +237,23 @@ object Application {
     }
   }
 
-  def countValuesInColumn(df: DataFrame, colName: String): DataFrame = {
+  def processRarity(df: DataFrame): DataFrame = {
+    val indexer = new StringIndexer()
+      .setInputCol("rarity")
+      .setOutputCol("rarityIndex")
+      .setHandleInvalid("keep")
 
+    val indexedDF = indexer.fit(df).transform(df)
+
+    val encoder = new OneHotEncoder()
+      .setInputCol("rarityIndex")
+      .setOutputCol("rarityEncoded")
+      .setDropLast(false)
+
+    encoder.fit(indexedDF).transform(indexedDF)
+  }
+
+  def countValuesInColumn(df: DataFrame, colName: String): DataFrame = {
     //count the values in the column and order them descending
     df.withColumn(colName, explode(col(colName))).groupBy(col(colName)).count().orderBy(functions.desc("count"))
   }
@@ -181,6 +263,10 @@ object Application {
       df.select(colName).collect().map(row => row.getString(0))
     else
       df.limit(threshold).select(colName).collect().map(row => row.getString(0))
+  }
+
+  def getAllRowsWithPrefix(df: DataFrame, prefix: String): Array[String] = {
+    df.columns.filter(_.startsWith(prefix))
   }
 
 }

@@ -1,9 +1,10 @@
 package linearregression
 
 import jdk.jfr.Threshold
+import org.apache.hadoop.shaded.com.google.common.base.Functions
 import org.apache.spark.ml.evaluation.RegressionEvaluator
 import org.apache.spark.sql.{DataFrame, SparkSession, functions}
-import org.apache.spark.sql.functions.{array_contains, avg, col, explode, lit, size, sum, udf, when}
+import org.apache.spark.sql.functions.{array_contains, avg, col, explode, lit, rand, round, abs,  size, sum, udf, when}
 import org.apache.spark.ml.feature.{OneHotEncoder, StringIndexer, VectorAssembler}
 import org.apache.spark.ml.regression.{LinearRegression, RandomForestRegressor}
 import org.apache.spark.sql.types.StructType
@@ -16,60 +17,48 @@ object Application {
       .master("local[*]")
       .getOrCreate()
 
+    spark.sparkContext.setLogLevel("ERROR")
+
     //load data
     val dataPath = "src/main/resources/scryfall-oracle-cards.json"
     val scryfallDataDF = spark.read.json(dataPath)
 
     val filteredDf = scryfallDataDF
       .filter(col("prices.eur").isNotNull && !col("digital") && col("type_line").contains("Creature") && col("card_faces").isNull)
-      .withColumn("label", col("prices.eur").cast("double"))
-    filteredDf.select("name", "cmc", "power", "toughness", "colors", "label", "edhrec_rank", "keywords", "type_line", "legalities", "rarity").show(5, truncate = false)
+      .withColumn("price", col("prices.eur").cast("double")).select("name", "cmc", "power", "toughness", "colors", "color_identity", "price", "edhrec_rank", "keywords", "type_line", "legalities", "rarity")
+    filteredDf.show(5)
 
 
     println("-> Starting feature processing...")
+    println("-> Step: Process CMC")
     val cmcProcessedDf = processCmc(filteredDf)
-    cmcProcessedDf.select("name", "cmc", "power", "label").show(5)
+    cmcProcessedDf.show(5)
 
+    println("-> Step: Process Power and Toughness")
     val ptProcessedDf = processPowerToughness(cmcProcessedDf)
-    ptProcessedDf.select("name", "cmc", "power", "toughness", "colors", "label").show(5, truncate = false)
+    ptProcessedDf.show(5)
 
+    println("-> Step: Process Colors and Color Identity")
     val colorProcessedDf = processColors(ptProcessedDf)
-    colorProcessedDf.select(
-      "name", "cmc", "power", "toughness", "color_W", "color_U", "color_G", "color_R", "color_B", "is_colorless",
-      "identity_W", "identity_U", "identity_G", "identity_R", "identity_B", "label").show(5, truncate = false)
+    colorProcessedDf.show(5)
 
+    println("-> Step: Process EDHREC Rank")
     val edhrecProcessedDf = processEdhrecRank(colorProcessedDf)
-    val nullValsBefore = colorProcessedDf.filter(col("edhrec_rank").isNull).count()
-    val nullValsAfter = edhrecProcessedDf.filter(col("edhrec_rank").isNull).count()
-    println(s"Null values in edhrec_rank \nbefore: $nullValsBefore \nafter: $nullValsAfter")
-    edhrecProcessedDf.select("name", "edhrec_rank", "rarity", "keywords").show(5, truncate = false)
+    edhrecProcessedDf.show(5)
 
-
-    val distinctKeywords = countValuesInColumn(edhrecProcessedDf, "keywords")
-    println(s"Distinct keywords and their counts: ${distinctKeywords.count()}")
-    distinctKeywords.orderBy(functions.rand()).show()
+    println("-> Step: Process Keywords")
     val keywordProcessedDf = processKeywords(edhrecProcessedDf, 50)
-    keywordProcessedDf.show(5, truncate = false)
+    keywordProcessedDf.show(5)
 
-    //udf to turn the type line into an array of strings
-    val toArrayUdf = udf((s: String) => {if (s != null) s.split("[^A-Za-z]+").map(_.trim) else Array.empty[String]})
-    //create a new column with the type line as array
-    val dfWithTypeArray = keywordProcessedDf.withColumn("type_line", toArrayUdf(col("type_line")))
-    //get disctinct types and their counts
-    val distinctTypes = countValuesInColumn(dfWithTypeArray, "type_line")
-    println(s"Distinct types and their counts: ${distinctTypes.count()}")
-    distinctTypes.sort(functions.rand()).show()
-
+    println("-> Step: Process Type Line")
     val typeLineProcessedDf = processTypeLine(keywordProcessedDf, 120)
-    typeLineProcessedDf.show(5, truncate = false)
+    typeLineProcessedDf.show(5)
 
+    println("-> Step: Process Legalities")
     val legalitiesProcessedDf = processLegalities(typeLineProcessedDf)
-    legalitiesProcessedDf.show(5, truncate = false)
+    legalitiesProcessedDf.show(5)
 
-    val columns = legalitiesProcessedDf.columns
-    val nullCounts = legalitiesProcessedDf.select(columns.map(c => sum(col(c).isNull.cast("int")).alias(c)): _*)
-    nullCounts.show()
-
+    println("-> Step: Process Rarity")
     val rarityProcessedDf = processRarity(legalitiesProcessedDf)
 
     //get all the color, type, keyword and legality columns
@@ -82,27 +71,21 @@ object Application {
     //build the array of feature columns
     val featureColumns = Array("cmc", "power", "toughness", "edhrec_rank", "rarityEncoded", "is_colorless") ++ colorColumns ++ identityColumns ++ keywordColumns ++ typeColumns ++ legalityColumns
 
-    rarityProcessedDf.select((Array("name", "label") ++ featureColumns).map(col): _*).show(5, truncate = false)
-
-    //check types of feature columns
-    val featureColumnTypes = rarityProcessedDf.select(featureColumns.map(col): _*).dtypes
-    featureColumnTypes.foreach { case (name, dataType) =>
-      println(s"Column: $name, Type: $dataType")
-    }
+    rarityProcessedDf.select((Array("name", "price") ++ featureColumns).map(col): _*).show(5)
 
     //assemble features into a single vector column
     val assembler = new VectorAssembler()
       .setInputCols(featureColumns)
       .setOutputCol("features")
 
-    val assembledDf = assembler.transform(rarityProcessedDf).select("name", "features", "label")
+    val assembledDf = assembler.transform(rarityProcessedDf).select("name", "features", "price")
 
     //split data into training and test sets
-    val Array(trainingData, testData) = assembledDf.randomSplit(Array(0.8, 0.2))
+    val Array(trainingData, testData) = assembledDf.randomSplit(Array(0.8, 0.2), seed = 84)
 
     //create a random forest regressor
     val forestRegressor = new RandomForestRegressor()
-      .setLabelCol("label")
+      .setLabelCol("price")
       .setFeaturesCol("features")
       .setNumTrees(100)
       .setMaxDepth(10)
@@ -117,12 +100,12 @@ object Application {
     val predictions = model.transform(testData)
 
     val rmseEvaluator = new RegressionEvaluator()
-      .setLabelCol("label")
+      .setLabelCol("price")
       .setPredictionCol("prediction")
       .setMetricName("rmse")
 
     val r2Evaluator = new RegressionEvaluator()
-      .setLabelCol("label")
+      .setLabelCol("price")
       .setPredictionCol("prediction")
       .setMetricName("r2")
 
@@ -131,6 +114,12 @@ object Application {
 
     println(s"Root Mean Squared Error (RMSE): $rmse")
     println(s"R²: $r2")
+
+    //show the actual and predicted prices for the test data
+    predictions.withColumn("prediction", round(col("prediction"), 2)).alias("p").join(testData.alias("t"), "name")
+      .orderBy(rand()).select("name", "p.price", "p.prediction")
+      .withColumn("difference", round(col("p.price") - col("p.prediction"), 2))
+      .show(20)
 
     //stop the session
     spark.stop()

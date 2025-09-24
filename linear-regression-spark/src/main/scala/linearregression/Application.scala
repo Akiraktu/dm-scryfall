@@ -104,8 +104,8 @@ object Application {
     val forestRegressor = new RandomForestRegressor()
       .setLabelCol("label")
       .setFeaturesCol("features")
-      .setNumTrees(100)
-      .setMaxDepth(10)
+      .setNumTrees(128)
+      .setMaxDepth(12)
       .setSeed(42)
 
     //train the model
